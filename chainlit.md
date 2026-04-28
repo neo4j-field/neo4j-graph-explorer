@@ -15,4 +15,6 @@ Ask questions in plain English. The app translates them to Cypher with Claude, r
 - `/sample` auto-load a small subgraph
 - `/agent <question>` use the eval-and-retry agent that runs its own Cypher, inspects results, and refines if needed
 
+Graphs render inline. **Double-click any node** to expand its 1-hop neighbors and grow the graph in place.
+
 Queries are read-only. Results are capped at the configured node limit to keep visualizations responsive.

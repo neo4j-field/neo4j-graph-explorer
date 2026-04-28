@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import uuid
@@ -13,14 +14,18 @@ from dotenv import load_dotenv
 
 from cypher_agent import CypherAgent
 from cypher_translator import CypherSafetyError, CypherTranslator
-from graph_renderer import GraphStats, render_records_to_html
+from graph_renderer import GraphStats, to_nvl_json
 from neo4j_client import Neo4jClient
+
+# Side-effect import: registers POST /api/cypher on Chainlit's FastAPI app.
+import cypher_api  # noqa: F401
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("app")
 
-OUTPUT_DIR = Path("public/graphs")
+OUTPUT_DIR = Path("public/graphs")  # legacy PyVis dumps (still gitignored)
+NVL_DATA_DIR = Path("public/nvl/data")  # per-message seed JSON for the NVL viewer
 MAX_NODES = int(os.environ.get("MAX_NODES", "200"))
 
 
@@ -133,13 +138,26 @@ async def on_message(message: cl.Message) -> None:
     )
 
 
-async def _handle_schema() -> None:
-    """Show the schema as text AND as a meta-graph visualization.
+def _write_nvl_seed(records) -> tuple[str, GraphStats]:
+    """Serialize records to /public/nvl/data/<uuid>.json and return (data_url, stats)."""
+    graph = to_nvl_json(records, max_nodes=MAX_NODES)
+    NVL_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    name = f"{uuid.uuid4().hex[:8]}.json"
+    path = NVL_DATA_DIR / name
+    path.write_text(
+        json.dumps({"nodes": graph.nodes, "relationships": graph.relationships})
+    )
+    return f"/public/nvl/data/{name}", graph.stats
 
-    Neo4j ships db.schema.visualization() out of the box: it returns
-    synthetic nodes (one per label) and synthetic relationships (one per
-    rel type), which we can pipe through the same PyVis renderer.
-    """
+
+def _viewer_element(data_url: str, height: int = 640) -> cl.CustomElement:
+    """Build the GraphViz CustomElement pointing at the NVL viewer with seed data."""
+    viewer_url = f"/public/nvl/viewer.html?data={data_url}"
+    return cl.CustomElement(name="GraphViz", props={"url": viewer_url, "height": height})
+
+
+async def _handle_schema() -> None:
+    """Show the schema as text and as an interactive data-model graph (NVL)."""
     schema = cl.user_session.get("schema")
     client: Neo4jClient = cl.user_session.get("client")
     if schema is None or client is None:
@@ -151,13 +169,12 @@ async def _handle_schema() -> None:
     try:
         records = client.run_read("CALL db.schema.visualization()")
         if records:
-            output_path = OUTPUT_DIR / f"schema_{uuid.uuid4().hex[:8]}.html"
-            stats = render_records_to_html(records=records, output_path=output_path, max_nodes=MAX_NODES)
-            iframe_url = f"/public/graphs/{output_path.name}"
-            elements.append(cl.CustomElement(name="GraphViz", props={"url": iframe_url, "height": 640}))
+            data_url, stats = _write_nvl_seed(records)
+            elements.append(_viewer_element(data_url))
             visual_summary = (
                 f"\n\n**Data model:** {stats.node_count} labels, "
-                f"{stats.edge_count} relationship types."
+                f"{stats.edge_count} relationship types. "
+                f"_Double-click a label to expand its connected types._"
             )
     except Exception as e:
         logger.warning("Schema visualization failed: %s", e)
@@ -190,11 +207,10 @@ async def _run_and_visualize(cypher: str, explanation: str, user_question: str) 
         ).send()
         return
 
-    output_path = OUTPUT_DIR / f"graph_{uuid.uuid4().hex[:8]}.html"
     try:
-        stats = render_records_to_html(records=records, output_path=output_path, max_nodes=MAX_NODES)
+        data_url, stats = _write_nvl_seed(records)
     except Exception as e:
-        logger.exception("Render failed")
+        logger.exception("NVL serialization failed")
         await cl.Message(content=f"Rendering failed: `{e}`").send()
         return
 
@@ -207,18 +223,7 @@ async def _run_and_visualize(cypher: str, explanation: str, user_question: str) 
         return
 
     summary = _format_stats(stats, explanation, cypher)
-    # Chainlit serves files under public/ at the root of its origin.
-    # public/graphs/abc.html  -->  /public/graphs/abc.html
-    iframe_url = f"/public/graphs/{output_path.name}"
-    await cl.Message(
-        content=summary,
-        elements=[
-            cl.CustomElement(
-                name="GraphViz",
-                props={"url": iframe_url, "height": 640},
-            )
-        ],
-    ).send()
+    await cl.Message(content=summary, elements=[_viewer_element(data_url)]).send()
 
 
 def _format_stats(stats: GraphStats, explanation: str, cypher: str) -> str:
@@ -232,7 +237,8 @@ def _format_stats(stats: GraphStats, explanation: str, cypher: str) -> str:
     return (
         f"_{explanation}_\n\n"
         f"**Cypher:**\n```cypher\n{cypher}\n```\n\n"
-        f"**Graph:** {stats.node_count} nodes, {stats.edge_count} edges.\n\n"
+        f"**Graph:** {stats.node_count} nodes, {stats.edge_count} edges. "
+        f"_Double-click any node to expand its neighbors._\n\n"
         f"**By label:**\n{label_lines or '  (none)'}\n\n"
         f"**By relationship type:**\n{rel_lines or '  (none)'}"
         f"{truncated_note}"
@@ -279,29 +285,23 @@ async def _run_agent(question: str) -> None:
         ).send()
         return
 
-    output_path = OUTPUT_DIR / f"graph_{uuid.uuid4().hex[:8]}.html"
     try:
-        stats = render_records_to_html(
-            records=result.final_records, output_path=output_path, max_nodes=MAX_NODES
-        )
+        data_url, stats = _write_nvl_seed(result.final_records)
     except Exception as e:
-        logger.exception("Render failed")
+        logger.exception("NVL serialization failed")
         await cl.Message(content=f"Rendering failed: `{e}`").send()
         return
 
-    iframe_url = f"/public/graphs/{output_path.name}"
     summary = (
         f"_{result.answer}_\n\n"
         f"**Final cypher** (after {result.iterations} iteration(s)):\n```cypher\n{result.final_query}\n```\n\n"
-        f"**Graph:** {stats.node_count} nodes, {stats.edge_count} edges."
+        f"**Graph:** {stats.node_count} nodes, {stats.edge_count} edges. "
+        f"_Double-click any node to expand its neighbors._"
     )
     if stats.truncated:
         summary += f"\n\n_Result truncated at {MAX_NODES} nodes._"
 
-    await cl.Message(
-        content=summary,
-        elements=[cl.CustomElement(name="GraphViz", props={"url": iframe_url, "height": 640})],
-    ).send()
+    await cl.Message(content=summary, elements=[_viewer_element(data_url)]).send()
 
 
 @cl.on_chat_end

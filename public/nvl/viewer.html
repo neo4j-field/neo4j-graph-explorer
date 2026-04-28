@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Graph Viewer</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    html, body, #frame {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: #1f1f23;
+      color: #f0f0f0;
+      font: 13px -apple-system, system-ui, sans-serif;
+    }
+    #toast {
+      position: fixed;
+      top: 12px;
+      left: 50%;
+      transform: translateX(-50%);
+      padding: 6px 14px;
+      background: rgba(0,0,0,0.6);
+      border: 1px solid #2a2a30;
+      border-radius: 999px;
+      font-size: 12px;
+      color: #cfd2d6;
+      z-index: 10;
+      transition: opacity 200ms ease;
+      pointer-events: none;
+    }
+    #toast.hidden { opacity: 0; }
+    #legend {
+      position: fixed;
+      top: 12px;
+      right: 12px;
+      max-width: 220px;
+      background: rgba(0,0,0,0.6);
+      border: 1px solid #2a2a30;
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 11px;
+      line-height: 1.6;
+      z-index: 10;
+      pointer-events: none;
+    }
+    #legend .swatch {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      margin-right: 6px;
+      vertical-align: middle;
+    }
+    #legend .hint {
+      margin-top: 6px;
+      padding-top: 6px;
+      border-top: 1px solid #2a2a30;
+      color: #9aa0a6;
+    }
+    #error {
+      position: fixed;
+      inset: 12px;
+      background: rgba(60,0,0,0.8);
+      border: 1px solid #832;
+      border-radius: 8px;
+      padding: 12px;
+      font-family: ui-monospace, SFMono-Regular, monospace;
+      font-size: 12px;
+      white-space: pre-wrap;
+      overflow: auto;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="frame"></div>
+  <div id="toast" class="hidden"></div>
+  <div id="legend"></div>
+  <pre id="error"></pre>
+
+  <script type="module">
+    // NVL ESM build (auto-bundles transitive deps + workers).
+    import { NVL } from "https://esm.sh/@neo4j-nvl/base@1.1.0";
+
+    const params = new URLSearchParams(location.search);
+    const dataUrl = params.get("data");
+    const frame = document.getElementById("frame");
+    const toast = document.getElementById("toast");
+    const legend = document.getElementById("legend");
+    const errorEl = document.getElementById("error");
+
+    function showError(e) {
+      errorEl.textContent = (e && e.stack) || String(e);
+      errorEl.style.display = "block";
+      console.error(e);
+    }
+
+    function showToast(msg, ms = 1500) {
+      toast.textContent = msg;
+      toast.classList.remove("hidden");
+      clearTimeout(toast._t);
+      toast._t = setTimeout(() => toast.classList.add("hidden"), ms);
+    }
+
+    function renderLegend(nodes) {
+      const colorByLabel = new Map();
+      for (const n of nodes) {
+        const label = (n.labels && n.labels[0]) || "Node";
+        if (!colorByLabel.has(label)) colorByLabel.set(label, n.color || "#888");
+      }
+      const lines = [...colorByLabel.entries()]
+        .sort()
+        .map(([label, color]) => `<div><span class="swatch" style="background:${color}"></span>${label}</div>`)
+        .join("");
+      legend.innerHTML = lines + `<div class="hint">Double-click a node to expand its neighbors.</div>`;
+    }
+
+    async function fetchCypher(query, parameters) {
+      const res = await fetch("/api/cypher", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query, params: parameters || {}, max_nodes: 200 }),
+      });
+      if (!res.ok) {
+        const detail = await res.text();
+        throw new Error(`/api/cypher ${res.status}: ${detail}`);
+      }
+      return res.json();
+    }
+
+    async function loadInitial() {
+      if (!dataUrl) throw new Error("Missing ?data=... query parameter");
+      const r = await fetch(dataUrl);
+      if (!r.ok) throw new Error(`Failed to fetch ${dataUrl}: ${r.status}`);
+      return r.json();
+    }
+
+    let nvl;
+    const seenIds = new Set();
+    const seenRelIds = new Set();
+
+    function trackSeen(nodes, rels) {
+      for (const n of nodes || []) seenIds.add(n.id);
+      for (const r of rels || []) seenRelIds.add(r.id);
+    }
+
+    function dedupe(payload) {
+      // NVL's addAndUpdateElementsInGraph dedupes by id, but filtering before
+      // reduces work and avoids unnecessary layout perturbation.
+      const newNodes = (payload.nodes || []).filter((n) => !seenIds.has(n.id));
+      const newRels = (payload.relationships || []).filter((r) => !seenRelIds.has(r.id));
+      return { nodes: newNodes, relationships: newRels };
+    }
+
+    async function expandNode(nodeId) {
+      showToast(`Expanding…`);
+      try {
+        const payload = await fetchCypher(
+          "MATCH (n)-[r]-(m) WHERE elementId(n) = $id RETURN n, r, m LIMIT 25",
+          { id: nodeId },
+        );
+        const fresh = dedupe(payload);
+        const added = fresh.nodes.length + fresh.relationships.length;
+        if (added === 0) {
+          showToast("No new neighbors");
+          return;
+        }
+        nvl.addAndUpdateElementsInGraph(fresh.nodes, fresh.relationships);
+        trackSeen(fresh.nodes, fresh.relationships);
+        showToast(`+${fresh.nodes.length} nodes, +${fresh.relationships.length} edges`);
+      } catch (e) {
+        showError(e);
+      }
+    }
+
+    async function init() {
+      try {
+        const initial = await loadInitial();
+        trackSeen(initial.nodes, initial.relationships);
+        renderLegend(initial.nodes || []);
+
+        nvl = new NVL(
+          frame,
+          initial.nodes || [],
+          initial.relationships || [],
+          {
+            initialZoom: 0.75,
+            disableTelemetry: true,
+            useWebGLRenderer: true,
+            relationshipThreshold: 0.55,
+            allowDynamicMinZoom: true,
+            styling: {
+              defaultNodeColor: "#9aa0a6",
+              defaultRelationshipColor: "#5e6166",
+            },
+          },
+          {
+            onError: (err) => showError(err),
+          },
+        );
+
+        // Double-click handler — NVL exposes hits via getHits(evt).
+        frame.addEventListener("dblclick", (evt) => {
+          const hits = nvl.getHits(evt);
+          const nodes = (hits && hits.nvlTargets && hits.nvlTargets.nodes) || [];
+          if (nodes.length === 0) return;
+          // hits returns hit-test entries; the actual node id lives at .data.id
+          const target = nodes[0];
+          const id = (target.data && target.data.id) || target.id;
+          if (id != null) expandNode(String(id));
+        });
+
+        // Single click — surface a transient toast with the node label/caption.
+        frame.addEventListener("click", (evt) => {
+          const hits = nvl.getHits(evt);
+          const nodes = (hits && hits.nvlTargets && hits.nvlTargets.nodes) || [];
+          if (nodes.length === 0) return;
+          const t = nodes[0];
+          const data = t.data || {};
+          const cap = data.caption || data.id;
+          showToast(`${cap}`);
+        });
+      } catch (e) {
+        showError(e);
+      }
+    }
+
+    init();
+  </script>
+</body>
+</html>

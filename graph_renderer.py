@@ -1,8 +1,13 @@
-"""Render Neo4j result records to interactive PyVis HTML.
+"""Convert Neo4j result records to graph data for NVL or PyVis.
 
-Walks every value in every record and pulls out Node and Relationship
-instances. This handles the common shapes returned by typical exploration
-queries: RETURN n, RETURN n, r, m, RETURN path, etc.
+Two output formats:
+- `to_nvl_json` returns a dict shaped for the Neo4j NVL JS library
+  (nodes: [{id, caption, color, properties}], relationships: [{id, from, to, caption, properties}])
+- `render_records_to_html` writes a self-contained PyVis HTML file (legacy path)
+
+Both walk every value in every record to pull out Node, Relationship, and Path
+objects. Handles the common shapes returned by exploration queries: RETURN n,
+RETURN n, r, m, RETURN path, etc.
 """
 
 from __future__ import annotations
@@ -27,6 +32,98 @@ class GraphStats:
     label_distribution: dict[str, int]
     rel_type_distribution: dict[str, int]
     truncated: bool
+
+
+@dataclass
+class NvlGraph:
+    """NVL-shaped graph data plus computed stats, ready for the viewer."""
+    nodes: list[dict]
+    relationships: list[dict]
+    stats: GraphStats
+
+
+def to_nvl_json(records: Iterable[Any], max_nodes: int) -> NvlGraph:
+    """Walk records and produce data shaped for the @neo4j-nvl/base library.
+
+    NVL nodes need at minimum {id}; relationships need {id, from, to}. We add
+    caption (the value rendered on the node), color (deterministic from primary
+    label), labels (list), and a flat properties dict for tooltip display.
+    """
+    nodes: dict[str, Any] = {}
+    edges: dict[str, Any] = {}
+    truncated = False
+
+    for record in records:
+        for value in record.values():
+            for n, r in _walk_for_graph_objects(value):
+                if n is not None:
+                    if n.element_id not in nodes:
+                        if len(nodes) >= max_nodes:
+                            truncated = True
+                            continue
+                        nodes[n.element_id] = n
+                if r is not None:
+                    edges[r.element_id] = r
+
+    label_to_color = _assign_label_colors({label for n in nodes.values() for label in n.labels})
+
+    nvl_nodes: list[dict] = []
+    for node in nodes.values():
+        primary_label = next(iter(node.labels), "Node")
+        nvl_nodes.append({
+            "id": str(node.element_id),
+            "caption": _node_caption(node),
+            "color": label_to_color.get(primary_label, "#888888"),
+            "labels": list(node.labels),
+            "properties": _safe_props(node),
+        })
+
+    nvl_rels: list[dict] = []
+    for rel in edges.values():
+        start = str(rel.start_node.element_id)
+        end = str(rel.end_node.element_id)
+        if start in {str(k) for k in nodes} and end in {str(k) for k in nodes}:
+            nvl_rels.append({
+                "id": str(rel.element_id),
+                "from": start,
+                "to": end,
+                "caption": rel.type,
+                "type": rel.type,
+                "properties": _safe_props(rel),
+            })
+
+    label_distribution: dict[str, int] = {}
+    for n in nodes.values():
+        for label in n.labels:
+            label_distribution[label] = label_distribution.get(label, 0) + 1
+
+    rel_type_distribution: dict[str, int] = {}
+    for r in edges.values():
+        rel_type_distribution[r.type] = rel_type_distribution.get(r.type, 0) + 1
+
+    stats = GraphStats(
+        node_count=len(nodes),
+        edge_count=len(nvl_rels),
+        label_distribution=dict(sorted(label_distribution.items(), key=lambda kv: -kv[1])),
+        rel_type_distribution=dict(sorted(rel_type_distribution.items(), key=lambda kv: -kv[1])),
+        truncated=truncated,
+    )
+    return NvlGraph(nodes=nvl_nodes, relationships=nvl_rels, stats=stats)
+
+
+def _safe_props(entity: Any) -> dict[str, str]:
+    """Stringify property values for safe JSON serialization and tooltip display."""
+    out: dict[str, str] = {}
+    try:
+        items = entity.items()
+    except Exception:
+        return out
+    for k, v in items:
+        try:
+            out[k] = _truncate(v)
+        except Exception:
+            out[k] = "<unprintable>"
+    return out
 
 
 def render_records_to_html(

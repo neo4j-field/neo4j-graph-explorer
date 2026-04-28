@@ -18,10 +18,12 @@ venv/
 .files/
 chainlit.db
 
-# Generated visualizations (keep elements/, ignore generated graph HTMLs)
+# Generated visualizations (keep elements/ and viewer.html, ignore generated artifacts)
 output/
 public/graphs/*
 !public/graphs/.gitkeep
+public/nvl/data/*
+!public/nvl/data/.gitkeep
 *.html.tmp
 
 # OS / editor
