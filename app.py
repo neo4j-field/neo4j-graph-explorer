@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 from cypher_agent import CypherAgent
 from cypher_translator import CypherSafetyError, CypherTranslator
 from graph_renderer import GraphStats, to_nvl_json
-from neo4j_client import Neo4jClient
+from neo4j_client import Neo4jClient, get_default_client
 
 # Side-effect import: registers POST /api/cypher on Chainlit's FastAPI app.
 import cypher_api  # noqa: F401
@@ -33,7 +33,7 @@ MAX_NODES = int(os.environ.get("MAX_NODES", "200"))
 async def on_chat_start() -> None:
     """Connect to Neo4j, introspect the schema, prime the translator, greet the user."""
     try:
-        client = Neo4jClient.from_env()
+        client = get_default_client()
         client.verify_connectivity()
     except Exception as e:
         await cl.Message(
@@ -306,6 +306,7 @@ async def _run_agent(question: str) -> None:
 
 @cl.on_chat_end
 async def on_chat_end() -> None:
-    client: Neo4jClient | None = cl.user_session.get("client")
-    if client is not None:
-        client.close()
+    # The Neo4j driver is now a process-wide singleton (shared with /api/cypher
+    # and any other concurrent chat sessions), so we don't close it on chat end.
+    # It will be torn down naturally when the process exits.
+    pass

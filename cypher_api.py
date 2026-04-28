@@ -23,19 +23,9 @@ from pydantic import BaseModel, Field
 
 from cypher_translator import CypherSafetyError, CypherTranslator
 from graph_renderer import to_nvl_json
-from neo4j_client import Neo4jClient
+from neo4j_client import get_default_client
 
 logger = logging.getLogger(__name__)
-
-# Lazy-initialized so the endpoint module can be imported before the env is loaded.
-_client: Neo4jClient | None = None
-
-
-def _get_client() -> Neo4jClient:
-    global _client
-    if _client is None:
-        _client = Neo4jClient.from_env()
-    return _client
 
 
 class CypherRequest(BaseModel):
@@ -63,7 +53,7 @@ async def cypher_endpoint(req: CypherRequest, request: Request) -> dict[str, Any
         raise HTTPException(status_code=400, detail=f"Mutating Cypher rejected: {e}")
 
     try:
-        client = _get_client()
+        client = get_default_client()
         records = client.run_read(req.query, req.params)
     except Exception as e:
         logger.exception("Cypher execution failed: %s", req.query[:200])

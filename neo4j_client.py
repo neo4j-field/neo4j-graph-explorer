@@ -159,6 +159,20 @@ class Neo4jClient:
         self._driver.close()
 
 
+# Process-wide default client. Both Chainlit chat sessions and the /api/cypher
+# endpoint share this so we don't accumulate per-session drivers (each carries
+# its own routing table and can grow stale if it sits idle while another path
+# stays warm). Created lazily on first access; closed when the process exits.
+_default_client: "Neo4jClient | None" = None
+
+
+def get_default_client() -> "Neo4jClient":
+    global _default_client
+    if _default_client is None:
+        _default_client = Neo4jClient.from_env()
+    return _default_client
+
+
 def _required(name: str) -> str:
     value = os.environ.get(name)
     if not value:
