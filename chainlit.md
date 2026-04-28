@@ -10,8 +10,9 @@ Ask questions in plain English. The app translates them to Cypher with Claude, r
 
 ## Slash commands
 
-- `/schema` show node labels and relationship types
+- `/schema` show node labels and relationship types, plus the data-model graph
 - `/cypher MATCH (n) RETURN n LIMIT 10` run raw Cypher (read-only)
 - `/sample` auto-load a small subgraph
+- `/agent <question>` use the eval-and-retry agent that runs its own Cypher, inspects results, and refines if needed
 
 Queries are read-only. Results are capped at the configured node limit to keep visualizations responsive.

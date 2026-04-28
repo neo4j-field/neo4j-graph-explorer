@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import uuid
@@ -10,6 +11,7 @@ from pathlib import Path
 import chainlit as cl
 from dotenv import load_dotenv
 
+from cypher_agent import CypherAgent
 from cypher_translator import CypherSafetyError, CypherTranslator
 from graph_renderer import GraphStats, render_records_to_html
 from neo4j_client import Neo4jClient
@@ -55,9 +57,10 @@ async def on_chat_start() -> None:
         f"{len(schema.relationship_types)} relationship types, "
         f"{len(schema.property_keys)} property keys.\n\n"
         f"Ask a question in plain English, or use:\n"
-        f"- `/schema` to see labels and relationship types\n"
+        f"- `/schema` to see the data model (text + graph)\n"
         f"- `/cypher <query>` to run raw read-only Cypher\n"
-        f"- `/sample` to load a small subgraph"
+        f"- `/sample` to load a small subgraph\n"
+        f"- `/agent <question>` for the eval-and-retry agent that can refine its own query"
     )
     await cl.Message(content=summary).send()
 
@@ -95,6 +98,14 @@ async def on_message(message: cl.Message) -> None:
             await cl.Message(content=f"**Rejected.** {e}").send()
             return
         await _run_and_visualize(cypher=cypher, explanation="Raw query (user-supplied).", user_question=text)
+        return
+
+    if text.startswith("/agent"):
+        question = text[len("/agent"):].strip()
+        if not question:
+            await cl.Message(content="Usage: `/agent <natural language question>`").send()
+            return
+        await _run_agent(question)
         return
 
     async with cl.Step(name="Translate to Cypher", type="llm") as step:
@@ -226,6 +237,71 @@ def _format_stats(stats: GraphStats, explanation: str, cypher: str) -> str:
         f"**By relationship type:**\n{rel_lines or '  (none)'}"
         f"{truncated_note}"
     )
+
+
+async def _run_agent(question: str) -> None:
+    client: Neo4jClient = cl.user_session.get("client")
+    schema = cl.user_session.get("schema")
+    if client is None or schema is None:
+        await cl.Message(content="Session not initialized. Reload the page.").send()
+        return
+
+    agent = CypherAgent(neo4j_client=client, schema=schema, node_cap=MAX_NODES)
+
+    async with cl.Step(name="Agent loop", type="run") as step:
+        try:
+            # Sync tool_runner; offload to a worker thread so we don't block
+            # Chainlit's event loop while Anthropic + Aura roundtrips happen.
+            result = await asyncio.to_thread(agent.answer, question)
+        except Exception as e:
+            logger.exception("Agent failed")
+            step.output = f"Failed: {e}"
+            await cl.Message(content=f"Agent failed: `{e}`").send()
+            return
+
+        log_lines: list[str] = [f"**{result.iterations} iteration(s)**"]
+        for s in result.steps:
+            if s.query:
+                log_lines.append(f"\n**Iteration {s.index} query:**\n```cypher\n{s.query}\n```")
+            if s.tool_summary:
+                log_lines.append(f"_Tool result:_\n```\n{s.tool_summary}\n```")
+            if s.text:
+                log_lines.append(f"_Reasoning:_ {s.text}")
+        step.output = "\n".join(log_lines)
+
+    if not result.final_records:
+        await cl.Message(
+            content=(
+                f"_{result.answer}_\n\n"
+                f"**Final cypher:**\n```cypher\n{result.final_query or '(none)'}\n```\n\n"
+                f"_(no graph entities to visualize)_"
+            )
+        ).send()
+        return
+
+    output_path = OUTPUT_DIR / f"graph_{uuid.uuid4().hex[:8]}.html"
+    try:
+        stats = render_records_to_html(
+            records=result.final_records, output_path=output_path, max_nodes=MAX_NODES
+        )
+    except Exception as e:
+        logger.exception("Render failed")
+        await cl.Message(content=f"Rendering failed: `{e}`").send()
+        return
+
+    iframe_url = f"/public/graphs/{output_path.name}"
+    summary = (
+        f"_{result.answer}_\n\n"
+        f"**Final cypher** (after {result.iterations} iteration(s)):\n```cypher\n{result.final_query}\n```\n\n"
+        f"**Graph:** {stats.node_count} nodes, {stats.edge_count} edges."
+    )
+    if stats.truncated:
+        summary += f"\n\n_Result truncated at {MAX_NODES} nodes._"
+
+    await cl.Message(
+        content=summary,
+        elements=[cl.CustomElement(name="GraphViz", props={"url": iframe_url, "height": 640})],
+    ).send()
 
 
 @cl.on_chat_end
