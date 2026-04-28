@@ -123,11 +123,39 @@ async def on_message(message: cl.Message) -> None:
 
 
 async def _handle_schema() -> None:
+    """Show the schema as text AND as a meta-graph visualization.
+
+    Neo4j ships db.schema.visualization() out of the box: it returns
+    synthetic nodes (one per label) and synthetic relationships (one per
+    rel type), which we can pipe through the same PyVis renderer.
+    """
     schema = cl.user_session.get("schema")
-    if schema is None:
+    client: Neo4jClient = cl.user_session.get("client")
+    if schema is None or client is None:
         await cl.Message(content="Schema not loaded.").send()
         return
-    await cl.Message(content=f"```\n{schema.to_prompt_block()}\n```").send()
+
+    elements: list = []
+    visual_summary = ""
+    try:
+        records = client.run_read("CALL db.schema.visualization()")
+        if records:
+            output_path = OUTPUT_DIR / f"schema_{uuid.uuid4().hex[:8]}.html"
+            stats = render_records_to_html(records=records, output_path=output_path, max_nodes=MAX_NODES)
+            iframe_url = f"/public/graphs/{output_path.name}"
+            elements.append(cl.CustomElement(name="GraphViz", props={"url": iframe_url, "height": 640}))
+            visual_summary = (
+                f"\n\n**Data model:** {stats.node_count} labels, "
+                f"{stats.edge_count} relationship types."
+            )
+    except Exception as e:
+        logger.warning("Schema visualization failed: %s", e)
+        visual_summary = f"\n\n_(schema visualization unavailable: {e})_"
+
+    await cl.Message(
+        content=f"```\n{schema.to_prompt_block()}\n```{visual_summary}",
+        elements=elements,
+    ).send()
 
 
 async def _run_and_visualize(cypher: str, explanation: str, user_question: str) -> None:
