@@ -1,0 +1,31 @@
+# Secrets
+.env
+*.env.local
+Neo4j-*.txt
+Neo4j-credentials-*.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Chainlit
+.chainlit/
+.files/
+chainlit.db
+
+# Generated visualizations (keep elements/, ignore generated graph HTMLs)
+output/
+public/graphs/*
+!public/graphs/.gitkeep
+*.html.tmp
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
